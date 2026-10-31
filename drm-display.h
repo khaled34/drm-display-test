@@ -88,6 +88,15 @@ struct drm_display_output {
 	uint32_t mode_blob_id;
 	bool mode_set;
 
+	drmModeModeInfo saved_crtc_mode;
+	uint32_t saved_crtc_buffer_id;
+	uint32_t saved_crtc_x;
+	uint32_t saved_crtc_y;
+	uint32_t *saved_connector_ids;
+	unsigned int saved_connector_count;
+	bool saved_crtc_mode_valid;
+	bool saved_crtc_state_valid;
+
 	uint32_t connector_id;
 	struct drm_display_connector_properties connector_properties;
 
