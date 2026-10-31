@@ -441,12 +441,34 @@ error:
 int drm_display_teardown(struct drm_display *display)
 {
 	unsigned int i;
+	int ret = 0;
 
 	if (!display || !display->up)
 		return -EINVAL;
 
-	if (display->primary_setup.configured)
-		drm_display_detach(display, &display->primary_setup);
+	/* Restore the console's CRTC before freeing the framebuffers we used. */
+	if (display->output.saved_crtc_state_valid &&
+	    (display->primary_setup.configured ||
+	     display->overlay_setup.configured)) {
+		if (display->output.saved_crtc_mode_valid) {
+			if (drmModeSetCrtc(display->drm_fd,
+					   display->output.crtc_id,
+					   display->output.saved_crtc_buffer_id,
+					   display->output.saved_crtc_x,
+					   display->output.saved_crtc_y,
+					   display->output.saved_connector_ids,
+					   display->output.saved_connector_count,
+					   &display->output.saved_crtc_mode))
+				ret = -errno;
+		} else if (drmModeSetCrtc(display->drm_fd,
+					 display->output.crtc_id, 0, 0, 0,
+					 NULL, 0, NULL)) {
+			ret = -errno;
+		}
+	}
+
+	display->primary_setup.configured = false;
+	display->overlay_setup.configured = false;
 
 	for (i = 0; i < display->primary_buffers_count; i++) {
 		struct drm_display_buffer *buffer =
@@ -454,9 +476,6 @@ int drm_display_teardown(struct drm_display *display)
 
 		drm_display_buffer_teardown(display, buffer);
 	}
-
-	if (display->overlay_setup.configured)
-		drm_display_detach(display, &display->overlay_setup);
 
 	for (i = 0; i < display->overlay_buffers_count; i++) {
 		struct drm_display_buffer *buffer =
@@ -471,7 +490,54 @@ int drm_display_teardown(struct drm_display *display)
 		display->output.mode_blob_id = 0;
 	}
 
+	free(display->output.saved_connector_ids);
+	display->output.saved_connector_ids = NULL;
+	display->output.saved_connector_count = 0;
+	display->output.saved_crtc_state_valid = false;
+
 	display->up = false;
+
+	return ret;
+}
+
+static int crtc_connectors_save(struct drm_display *display,
+			       drmModeResPtr resources)
+{
+	uint32_t *connector_ids;
+	unsigned int count = 0;
+	unsigned int i;
+
+	connector_ids = calloc(resources->count_connectors,
+			       sizeof(*connector_ids));
+	if (resources->count_connectors && !connector_ids)
+		return -ENOMEM;
+
+	for (i = 0; i < resources->count_connectors; i++) {
+		drmModeConnectorPtr connector;
+		drmModeEncoderPtr encoder;
+
+		connector = drmModeGetConnector(display->drm_fd,
+						resources->connectors[i]);
+		if (!connector)
+			continue;
+
+		if (!connector->encoder_id) {
+			drmModeFreeConnector(connector);
+			continue;
+		}
+
+		encoder = drmModeGetEncoder(display->drm_fd,
+					    connector->encoder_id);
+		if (encoder && encoder->crtc_id == display->output.crtc_id)
+			connector_ids[count++] = connector->connector_id;
+
+		if (encoder)
+			drmModeFreeEncoder(encoder);
+		drmModeFreeConnector(connector);
+	}
+
+	display->output.saved_connector_ids = connector_ids;
+	display->output.saved_connector_count = count;
 
 	return 0;
 }
@@ -796,6 +862,18 @@ next_plane:
 			display->output.mode.vdisplay;
 	}
 
+	/* Keep enough of the original CRTC state to restore the console later. */
+	display->output.saved_crtc_mode_valid = crtc->mode_valid;
+	display->output.saved_crtc_buffer_id = crtc->buffer_id;
+	display->output.saved_crtc_x = crtc->x;
+	display->output.saved_crtc_y = crtc->y;
+	memcpy(&display->output.saved_crtc_mode, &crtc->mode,
+	       sizeof(display->output.saved_crtc_mode));
+	ret = crtc_connectors_save(display, resources);
+	if (ret)
+		goto error;
+	display->output.saved_crtc_state_valid = true;
+
 	ret = 0;
 	goto complete;
 
@@ -910,6 +988,13 @@ void drm_display_close(struct drm_display *display)
 {
 	if (!display)
 		return;
+
+	if (display->up)
+		drm_display_teardown(display);
+	else if (display->output.saved_connector_ids) {
+		free(display->output.saved_connector_ids);
+		display->output.saved_connector_ids = NULL;
+	}
 
 	if (display->drm_path)
 		free(display->drm_path);
